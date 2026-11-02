@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible problem in the CLI or report format.
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: "Do not include API keys, private prompts, completions, or unredacted provider responses."
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Describe the observed behavior and what you expected.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Project version
+    validations:
+      required: true
+  - type: input
+    id: provider
+    attributes:
+      label: Provider and API compatibility
+      description: Share only non-sensitive provider/model identifiers.
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Use a mocked or redacted example; never paste credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version and operating system.
+    validations:
+      required: false
