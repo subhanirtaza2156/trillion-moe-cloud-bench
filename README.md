@@ -1,82 +1,86 @@
 # TrillionMoE Cloud Bench
 
-A lightweight benchmark CLI for **remote, OpenAI-compatible inference APIs**. Compare latency, throughput, token usage, and failures across hosted large-model endpoints, including Mixture-of-Experts services.
+**Measure remote large-model inference from a lightweight client.**
 
-> This project does not train, download, or run trillion-parameter weights. Your computer sends small HTTPS requests to a provider endpoint; model inference happens on the provider's infrastructure.
+TrillionMoE Cloud Bench is an open-source Python CLI for running bounded, repeatable benchmarks against remote OpenAI-compatible inference APIs. It records latency, throughput, provider-reported token usage, and failures without downloading or running model weights.
 
-## Features
+> **A trillion-parameter model is not running on your laptop.** This project measures a model served by a cloud provider. Your computer sends small HTTPS requests; inference stays on the provider's infrastructure.
 
-- Uses Python's standard library; no heavy ML dependencies
-- Sends repeated chat-completion requests to an OpenAI-compatible endpoint
-- Reports successful requests, failures, average and p50/p95 latency, requests/second, and output tokens/second when usage data is returned
-- Can save machine-readable JSON results
-- Reads API credentials from an environment variable; never writes them to disk
+[Product brief](docs/PRODUCT.md) · [Architecture](docs/ARCHITECTURE.md) · [Roadmap](docs/ROADMAP.md) · [Benchmark methodology](docs/BENCHMARKING.md) · [Contributing](CONTRIBUTING.md)
 
-## Requirements
+## Why this project
 
-- Python 3.10+
-- An OpenAI-compatible remote inference endpoint and a model ID
-- Network access to that endpoint
+“1T parameters” describes a model, not the service experience a developer gets. Endpoint latency and throughput also depend on provider hardware, batching, queueing, network location, prompt length, and generation settings. This tool captures the workload and client-observed results in a portable JSON report so engineers can make more grounded comparisons.
 
-## Quickstart
+## What it does
 
-Install from a checkout:
+- Calls the common OpenAI chat-completions API shape
+- Runs a requested number of calls with explicitly bounded concurrency
+- Supports optional warm-up requests
+- Reports success/failure totals, mean/p50/p95 latency, requests per second, and output tokens per second when the provider returns usage
+- Saves a versioned JSON report on request
+- Reads API keys from a named environment variable and omits prompts/completions from reports
+- Uses Python's standard library at runtime; no GPU or ML stack is needed
+
+## What it does not do
+
+It does not train, host, download, quantize, or locally run trillion-parameter models. It does not measure server-side GPU utilization or isolated model compute. It does not retry failures automatically, upload reports, or call a provider until you run the command yourself.
+
+## Install
+
+Requires Python 3.10 or newer.
 
 ```bash
 python -m pip install .
 ```
 
-Set your provider key in the environment (replace the variable name/value for your provider):
+Set the environment variable used by your provider:
 
-```bash
+```powershell
 # PowerShell
 $env:TRILLION_BENCH_API_KEY = "your-provider-key"
+```
 
+```bash
 # macOS / Linux
 export TRILLION_BENCH_API_KEY="your-provider-key"
 ```
 
-Run a small benchmark:
+## Run a small benchmark
 
 ```bash
 trillion-bench run \
   --base-url https://your-provider.example/v1 \
   --model your-model-id \
-  --prompt "Explain mixture-of-experts inference in one paragraph." \
   --requests 5 \
+  --concurrency 1 \
+  --warmup 0 \
+  --max-tokens 128 \
   --api-key-env TRILLION_BENCH_API_KEY \
   --output results.json
 ```
 
-You can also run it without installing:
+The endpoint URL must use HTTPS, except for localhost testing. Start with low request counts and concurrency. Requests and warm-ups may incur provider charges and may be subject to rate limits.
+
+For full options:
 
 ```bash
-python -m trillion_moe_cloud_bench run --base-url https://your-provider.example/v1 --model your-model-id
+trillion-bench run --help
 ```
 
-The CLI defaults to 5 requests and a short sample prompt. Start with a low request count and respect the provider's rate limits and billing terms. The tool makes real requests and may incur provider charges.
+## How to read results
 
-## Output metrics
+Latency is end-to-end time observed by the client. It includes network transit, provider queueing, generation, and response transfer. Percentiles use nearest rank over successful samples. Output tokens per second is reported only when the endpoint returns token usage.
 
-- **Latency:** client-observed end-to-end request duration
-- **p50 / p95:** nearest-rank latency percentiles over successful requests
-- **Requests/sec:** successful requests divided by total benchmark wall time
-- **Output tokens/sec:** reported completion tokens divided by total benchmark wall time; omitted when the provider does not return usage data
+Results are meaningful only alongside their conditions. Keep provider region, model revision, prompt, generation settings, concurrency, warm-up policy, and client network location aligned. See [benchmark methodology](docs/BENCHMARKING.md) before publishing comparisons.
 
-These are client-side measurements, not claims about a model's internal compute speed. Network conditions, provider queues, caching, generation length, and rate limits affect results. Compare runs only when prompts, generation settings, region, and provider conditions are similar.
+## Project status
 
-## Provider compatibility
+The project is in active early development. The current milestone is a reliable single-endpoint benchmark CLI and documented report schema. Provider profiles, CSV export, report comparison, streaming metrics, and a static report viewer are planned; see the [roadmap](docs/ROADMAP.md).
 
-The first version calls `POST {base-url}/chat/completions` and expects the common OpenAI chat-completions response shape. Providers may differ in URL format, authentication, or usage reporting. Check your provider's API docs before running.
+## Contributing
 
-## Development
-
-```bash
-python -m pip install -e .
-python -m trillion_moe_cloud_bench --help
-```
-
-Contributions are welcome. Please open an issue with the provider/API shape and a redacted example response when reporting compatibility problems. Never include API keys or private prompts in issues.
+Read [CONTRIBUTING.md](CONTRIBUTING.md) and open an issue for larger changes. CI never calls a paid live inference endpoint.
 
 ## License
 
