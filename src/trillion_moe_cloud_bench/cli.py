@@ -1,29 +1,23 @@
-"""Command-line benchmark for remote OpenAI-compatible chat APIs."""
+"""Command-line interface for remote inference benchmarks."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
+import platform
 import sys
 import time
-import urllib.error
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
+
+from .client import endpoint_url, send_request
+from .metrics import build_report
 
 
 DEFAULT_PROMPT = "In a few sentences, explain how mixture-of-experts models route tokens."
-
-
-def percentile(values: list[float], fraction: float) -> float | None:
-    """Return a nearest-rank percentile, or None when there are no samples."""
-    if not values:
-        return None
-    ordered = sorted(values)
-    index = max(0, math.ceil(fraction * len(ordered)) - 1)
-    return ordered[index]
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -32,11 +26,13 @@ def make_parser() -> argparse.ArgumentParser:
         description="Measure a remote OpenAI-compatible chat-completions endpoint.",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
-    run = subparsers.add_parser("run", help="run repeated completion requests")
+    run = subparsers.add_parser("run", help="run a bounded completion benchmark")
     run.add_argument("--base-url", required=True, help="API base URL, for example https://host.example/v1")
     run.add_argument("--model", required=True, help="provider model ID")
-    run.add_argument("--prompt", default=DEFAULT_PROMPT, help="user prompt sent on every request")
-    run.add_argument("--requests", type=int, default=5, help="number of sequential requests (default: 5)")
+    run.add_argument("--prompt", default=DEFAULT_PROMPT, help="user prompt sent for every request")
+    run.add_argument("--requests", type=int, default=5, help="measured requests (default: 5)")
+    run.add_argument("--concurrency", type=int, default=1, help="maximum simultaneous requests (default: 1)")
+    run.add_argument("--warmup", type=int, default=0, help="unreported warm-up requests before measurement")
     run.add_argument("--max-tokens", type=int, default=128, help="maximum generated tokens per request")
     run.add_argument("--temperature", type=float, default=0.0, help="sampling temperature")
     run.add_argument("--timeout", type=float, default=120.0, help="per-request timeout in seconds")
@@ -45,58 +41,22 @@ def make_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def endpoint_url(base_url: str) -> str:
-    return base_url.rstrip("/") + "/chat/completions"
+def _safe_endpoint(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
 
 
-def send_request(
-    url: str,
-    model: str,
-    prompt: str,
-    max_tokens: int,
-    temperature: float,
-    api_key: str | None,
-    timeout: float,
-) -> dict[str, Any]:
-    payload = json.dumps(
-        {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
-    ).encode("utf-8")
-    headers = {"Content-Type": "application/json", "Accept": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    started = time.perf_counter()
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read()
-            status = response.status
-        elapsed = time.perf_counter() - started
-        parsed = json.loads(body.decode("utf-8"))
-        usage = parsed.get("usage") or {}
-        return {
-            "ok": True,
-            "latency_seconds": elapsed,
-            "status_code": status,
-            "prompt_tokens": usage.get("prompt_tokens"),
-            "completion_tokens": usage.get("completion_tokens"),
-        }
-    except urllib.error.HTTPError as exc:
-        elapsed = time.perf_counter() - started
-        # Do not include response bodies: providers can echo sensitive request data.
-        return {"ok": False, "latency_seconds": elapsed, "status_code": exc.code, "error": f"HTTP {exc.code}"}
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
-        elapsed = time.perf_counter() - started
-        return {"ok": False, "latency_seconds": elapsed, "error": type(exc).__name__}
-
-
-def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+def _validate(args: argparse.Namespace) -> None:
+    if not args.model.strip():
+        raise ValueError("--model must not be empty")
+    if not args.prompt:
+        raise ValueError("--prompt must not be empty")
     if args.requests < 1:
         raise ValueError("--requests must be at least 1")
+    if args.concurrency < 1 or args.concurrency > 64:
+        raise ValueError("--concurrency must be between 1 and 64")
+    if args.warmup < 0 or args.warmup > 20:
+        raise ValueError("--warmup must be between 0 and 20")
     if args.max_tokens < 1:
         raise ValueError("--max-tokens must be at least 1")
     if args.timeout <= 0:
@@ -104,12 +64,10 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
     if not 0 <= args.temperature <= 2:
         raise ValueError("--temperature must be between 0 and 2")
 
-    api_key = os.environ.get(args.api_key_env) if args.api_key_env else None
-    url = endpoint_url(args.base_url)
-    print(f"Sending {args.requests} sequential request(s) to {url}", file=sys.stderr)
-    started = time.perf_counter()
-    results = [
-        send_request(
+
+def _make_sender(args: argparse.Namespace, url: str, api_key: str | None):
+    def send() -> dict[str, Any]:
+        return send_request(
             url=url,
             model=args.model,
             prompt=args.prompt,
@@ -118,68 +76,87 @@ def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
             api_key=api_key,
             timeout=args.timeout,
         )
-        for _ in range(args.requests)
-    ]
-    wall_seconds = time.perf_counter() - started
+    return send
 
-    successful = [result for result in results if result["ok"]]
-    latencies = [result["latency_seconds"] for result in successful]
-    completion_values = [
-        result["completion_tokens"]
-        for result in successful
-        if isinstance(result.get("completion_tokens"), (int, float))
-    ]
-    prompt_values = [
-        result["prompt_tokens"]
-        for result in successful
-        if isinstance(result.get("prompt_tokens"), (int, float))
-    ]
-    total_completion_tokens = sum(completion_values) if completion_values else None
-    total_prompt_tokens = sum(prompt_values) if prompt_values else None
 
-    return {
-        "schema_version": 1,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "endpoint": url,
-        "model": args.model,
-        "request_count": args.requests,
-        "success_count": len(successful),
-        "failure_count": args.requests - len(successful),
-        "wall_time_seconds": wall_seconds,
-        "latency_seconds": {
-            "mean": sum(latencies) / len(latencies) if latencies else None,
-            "p50": percentile(latencies, 0.50),
-            "p95": percentile(latencies, 0.95),
-        },
-        "requests_per_second": len(successful) / wall_seconds if wall_seconds > 0 else None,
-        "prompt_tokens": total_prompt_tokens,
-        "completion_tokens": total_completion_tokens,
-        "output_tokens_per_second": (
-            total_completion_tokens / wall_seconds
-            if total_completion_tokens is not None and wall_seconds > 0
-            else None
-        ),
-        "results": results,
-    }
+def run_benchmark(args: argparse.Namespace) -> dict[str, Any]:
+    _validate(args)
+    api_key = None
+    if args.api_key_env:
+        api_key = os.environ.get(args.api_key_env)
+        if not api_key:
+            raise ValueError(f"environment variable {args.api_key_env!r} is not set or is empty")
+
+    url = endpoint_url(args.base_url)
+    send = _make_sender(args, url, api_key)
+    print(
+        f"Warm-ups: {args.warmup} | measured requests: {args.requests} | "
+        f"concurrency: {args.concurrency}",
+        file=sys.stderr,
+    )
+
+    # Warm-ups are explicit provider calls and may be billable.
+    for warmup_index in range(args.warmup):
+        result = send()
+        if not result["ok"]:
+            print(f"Warm-up {warmup_index + 1} failed: {result.get('error', 'request_error')}", file=sys.stderr)
+
+    started_at = datetime.now(timezone.utc).isoformat()
+    wall_started = time.perf_counter()
+    results: list[dict[str, Any] | None] = [None] * args.requests
+    with ThreadPoolExecutor(max_workers=args.concurrency) as pool:
+        futures = {pool.submit(send): index for index in range(args.requests)}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                results[index] = {"request_index": index + 1, **future.result()}
+            except Exception as exc:
+                results[index] = {
+                    "request_index": index + 1,
+                    "ok": False,
+                    "latency_seconds": 0.0,
+                    "error": type(exc).__name__,
+                }
+    wall_seconds = time.perf_counter() - wall_started
+    samples = [sample for sample in results if sample is not None]
+
+    report = build_report(
+        endpoint=_safe_endpoint(url),
+        model=args.model,
+        request_count=args.requests,
+        concurrency=args.concurrency,
+        warmup_count=args.warmup,
+        wall_time_seconds=wall_seconds,
+        results=samples,
+        python_version=platform.python_version(),
+        platform_name=platform.system(),
+    )
+    report["started_at"] = started_at
+    return report
 
 
 def print_summary(report: dict[str, Any]) -> None:
-    latencies = report["latency_seconds"]
+    summary = report["summary"]
+    latency = summary["latency_seconds"]
     print(f"Model: {report['model']}")
-    print(f"Requests: {report['success_count']} succeeded, {report['failure_count']} failed")
-    print(f"Wall time: {report['wall_time_seconds']:.3f}s")
-    if latencies["mean"] is not None:
+    print(f"Requests: {summary['success_count']} succeeded, {summary['failure_count']} failed")
+    print(f"Wall time: {summary['wall_time_seconds']:.3f}s")
+    if latency["mean"] is not None:
         print(
             "Latency: mean {mean:.3f}s | p50 {p50:.3f}s | p95 {p95:.3f}s".format(
-                mean=latencies["mean"], p50=latencies["p50"], p95=latencies["p95"]
+                mean=latency["mean"], p50=latency["p50"], p95=latency["p95"]
             )
         )
     else:
         print("Latency: no successful samples")
-    rate = report["requests_per_second"]
+    rate = summary["requests_per_second"]
     print(f"Requests/sec: {rate:.3f}" if rate is not None else "Requests/sec: n/a")
-    token_rate = report["output_tokens_per_second"]
-    print(f"Output tokens/sec: {token_rate:.3f}" if token_rate is not None else "Output tokens/sec: n/a (provider usage unavailable)")
+    token_rate = summary["output_tokens_per_second"]
+    print(
+        f"Output tokens/sec: {token_rate:.3f}"
+        if token_rate is not None
+        else "Output tokens/sec: n/a (provider usage unavailable)"
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -197,7 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             output_file.write("\n")
         print(f"JSON report saved to {args.output}")
 
-    return 0 if report["success_count"] else 1
+    return 0 if report["summary"]["success_count"] else 1
 
 
 if __name__ == "__main__":
